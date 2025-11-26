@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+*.manifest
+*.spec
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project - Model Checkpoints (large files)
+checkpoints/
+
+# Project - Working Directories
+input/
+output/
+temp/
+translate/
+final/
+logs/
+downloads/
+
+# Project - Sensitive Files
+.env
+cookies.txt
+
+# Reference Audio (optional, uncomment if you want to track)
+ref/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
