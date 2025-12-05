@@ -551,6 +551,3 @@ def load_model(checkpoint_path: str, device: str = "cuda") -> DAC:
     model.to(device)
     log_info(f"Loaded model: {result}")
     return model
-
-
-# Note: Use tts.py as the main entry point for TTS inference

@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 
-def load_env(env_path: Path = Path(".env")) -> None:
+def load_env(env_path: Path = Path("config/.env")) -> None:
     """Load environment variables from .env file."""
     if not env_path.exists():
         return
@@ -31,10 +31,14 @@ def download_media(
     format_selector: str | None,
     allow_auto_subs: bool,
     skip_download: bool,
+    skip_subs: bool = False,
 ) -> None:
     print(f"[Download] URL: {url}")
     print(f"[Download] Output: {output_dir}")
-    print(f"[Download] Subtitles: {sub_langs}, Auto-subs: {allow_auto_subs}")
+    if skip_subs:
+        print(f"[Download] Subtitles: disabled (will use ASR)")
+    else:
+        print(f"[Download] Subtitles: {sub_langs}, Auto-subs: {allow_auto_subs}")
     if skip_download:
         print("[Download] Mode: Subtitles only")
 
@@ -46,19 +50,32 @@ def download_media(
         "yt_dlp",
         "-o",
         out_template,
-        "--write-subs",
-        "--sub-langs",
-        sub_langs,
-        "--convert-subs",
-        "srt",
-        "--merge-output-format",
-        "mp4",
-        url,
+        "--restrict-filenames",  # Replace special chars with underscores in filenames
     ]
+
+    # Only add subtitle options if not skipping subs
+    if not skip_subs:
+        cmd.extend(
+            [
+                "--write-subs",
+                "--sub-langs",
+                sub_langs,
+                "--convert-subs",
+                "srt",
+            ]
+        )
+        if allow_auto_subs:
+            cmd.append("--write-auto-subs")
+
+    cmd.extend(
+        [
+            "--merge-output-format",
+            "mp4",
+            url,
+        ]
+    )
     if skip_download:
         cmd.append("--skip-download")
-    if allow_auto_subs:
-        cmd.append("--write-auto-subs")
     if proxy:
         cmd.extend(["--proxy", proxy])
     if cookies_from_browser:

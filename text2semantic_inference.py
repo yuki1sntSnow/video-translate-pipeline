@@ -832,6 +832,3 @@ def generate_long(*, model, device, decode_one_token, text, num_samples=1, max_n
 
         del y, codes
         yield GenerateResponse(action="next")
-
-
-# Note: Use tts.py as the main entry point for TTS inference

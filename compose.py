@@ -1,25 +1,18 @@
-"""
-Audio/Video Mixing and Composition
-
-Combines original video, translated subtitles, and TTS audio using FFmpeg.
-
-Audio Modes:
-    - replace: Replace original audio with TTS audio
-    - mix: Mix TTS with lowered original audio (ducking)
-    - dual: Keep both tracks as separate audio streams
-
-Features:
-    - Vocal/BGM separation interface (placeholder for demucs/spleeter)
-    - Subtitle burning option
-    - Audio timing alignment with subtitles
-"""
+"""Audio/Video composition - combines video, TTS audio, and subtitles."""
 
 import subprocess
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from srt_utils import parse_srt, SubtitleEntry, parse_timestamp
+from srt_utils import (
+    parse_srt,
+    SubtitleEntry,
+    parse_timestamp,
+    convert_srt_to_ass,
+    SubtitleStyle,
+    get_default_subtitle_style,
+)
 
 
 @dataclass
@@ -34,6 +27,46 @@ class AudioSegment:
 def check_ffmpeg() -> bool:
     """Check if FFmpeg is available."""
     return shutil.which("ffmpeg") is not None
+
+
+def check_nvenc() -> bool:
+    """Check if NVIDIA NVENC hardware encoder is available."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+        )
+        return "h264_nvenc" in result.stdout
+    except Exception:
+        return False
+
+
+# Cache NVENC availability check
+_nvenc_available: bool | None = None
+
+
+def get_video_encoder() -> tuple[str, list[str]]:
+    """Get best available video encoder and its options.
+
+    Returns:
+        (encoder_name, encoder_options) tuple
+    """
+    global _nvenc_available
+
+    if _nvenc_available is None:
+        _nvenc_available = check_nvenc()
+        if _nvenc_available:
+            print("[Compose] ✓ NVENC 硬件编码器可用，将使用 GPU 加速")
+        else:
+            print("[Compose] ⚠ NVENC 不可用，使用 CPU 软件编码（较慢）")
+
+    if _nvenc_available:
+        # NVENC with quality preset
+        return "h264_nvenc", ["-preset", "p4", "-rc", "vbr", "-cq", "23"]
+    else:
+        # Software x264 with faster preset
+        return "libx264", ["-preset", "fast", "-crf", "23"]
 
 
 def get_audio_duration(audio_path: Path) -> float:
@@ -183,9 +216,11 @@ def process_segment_overlap(
     for i, seg in enumerate(segments):
         # Find the corresponding SRT entry
         matching_entry = None
-        for entry in srt_entries:
+        matching_index = -1
+        for idx, entry in enumerate(srt_entries):
             if abs(parse_timestamp(entry.start_time) - seg.start_time) < 0.1:
                 matching_entry = entry
+                matching_index = idx
                 break
 
         if matching_entry is None:
@@ -196,6 +231,34 @@ def process_segment_overlap(
         # Calculate available time slot
         entry_end = parse_timestamp(matching_entry.end_time)
         slot_duration = entry_end - seg.start_time
+
+        # Handle too small slot: borrow time from next subtitle gap
+        if slot_duration <= 0.1:
+            # Try to extend slot to next subtitle's start time
+            if matching_index + 1 < len(srt_entries):
+                next_entry = srt_entries[matching_index + 1]
+                next_start = parse_timestamp(next_entry.start_time)
+                extended_slot = next_start - seg.start_time
+
+                if extended_slot > 0.1:
+                    slot_duration = extended_slot
+                    print(
+                        f"[Compose] ⚠ Extended slot for segment #{matching_entry.index} from {entry_end - seg.start_time:.3f}s to {slot_duration:.3f}s (borrowed time until next subtitle)"
+                    )
+                else:
+                    # Still too small, use original audio
+                    print(
+                        f"[Compose] ⚠ Invalid slot duration {slot_duration:.3f}s for segment #{matching_entry.index}, using original"
+                    )
+                    processed.append((seg, ""))
+                    continue
+            else:
+                # Last subtitle, use original audio
+                print(
+                    f"[Compose] ⚠ Last subtitle with short duration {slot_duration:.3f}s, using original"
+                )
+                processed.append((seg, ""))
+                continue
 
         # Check if TTS exceeds the slot
         if seg.duration > slot_duration + 0.1:  # 0.1s tolerance
@@ -210,25 +273,28 @@ def process_segment_overlap(
 
             elif strategy == "speed":
                 # Speed up to fit in slot
-                speed_factor = min(seg.duration / slot_duration, max_speed)
-                if speed_factor <= max_speed:
+                speed_factor = seg.duration / slot_duration
+                # Clamp speed_factor to valid range [0.5, max_speed]
+                speed_factor = max(0.5, min(speed_factor, max_speed))
+                if speed_factor <= max_speed and speed_factor >= 0.5:
                     filter_str = f"atempo={speed_factor:.3f}"
                     speed_count += 1
                 else:
                     # Too much speedup needed, truncate instead
-                    filter_str = f"atempo={max_speed},atrim=0:{slot_duration}"
+                    filter_str = f"atrim=0:{slot_duration}"
                     truncate_count += 1
                 processed.append((seg, filter_str))
 
             elif strategy == "hybrid":
                 # Use speed for small overflows, truncate for large ones
                 speed_factor = seg.duration / slot_duration
-                if speed_factor <= max_speed:
+                # Clamp to ffmpeg's atempo valid range [0.5, 100]
+                if speed_factor >= 0.5 and speed_factor <= max_speed:
                     # Speed up is acceptable
                     filter_str = f"atempo={speed_factor:.3f}"
                     speed_count += 1
                 else:
-                    # Too fast, just truncate
+                    # Out of acceptable range, just truncate
                     filter_str = f"atrim=0:{slot_duration}"
                     truncate_count += 1
                 processed.append((seg, filter_str))
@@ -308,12 +374,25 @@ def concat_audio_with_timing(
 
     filter_complex = ";".join(filter_parts)
 
+    # Use filter_complex_script file to avoid Windows command line length limit
+    filter_script_path = output_path.parent / f"{output_path.stem}_filter.txt"
+
+    # Ensure parent directory exists
+    filter_script_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write filter script with UTF-8 encoding
+    filter_script_path.write_text(filter_complex, encoding="utf-8")
+
+    # Verify file was created
+    if not filter_script_path.exists():
+        raise RuntimeError(f"Failed to create filter script: {filter_script_path}")
+
     cmd = [
         "ffmpeg",
         "-y",
         *inputs,
-        "-filter_complex",
-        filter_complex,
+        "-filter_complex_script",
+        str(filter_script_path),
         "-map",
         "[out]",
         "-t",
@@ -323,7 +402,20 @@ def concat_audio_with_timing(
         str(output_path),
     ]
 
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        # Print ffmpeg error output for debugging
+        print(f"[Compose] FFmpeg stderr: {e.stderr}")
+        raise
+    finally:
+        # Clean up filter script after successful execution
+        if filter_script_path.exists():
+            try:
+                filter_script_path.unlink()
+            except Exception as e:
+                print(f"[Compose] Warning: Could not delete filter script: {e}")
+
     return output_path
 
 
@@ -461,6 +553,9 @@ def compose_video(
     subtitle_path: Path | None,
     output_path: Path,
     burn_subtitles: bool = False,
+    max_line_width: float = 22.0,
+    max_lines: int = 2,
+    subtitle_style: SubtitleStyle | None = None,
 ) -> Path:
     """
     Compose final video with new audio and optional subtitles.
@@ -471,13 +566,53 @@ def compose_video(
         subtitle_path: SRT subtitle file (optional)
         output_path: Output video file
         burn_subtitles: Whether to burn subtitles into video
+        max_line_width: Max subtitle line width for burn-in (CJK char units)
+        max_lines: Maximum lines per subtitle (default 2)
+        subtitle_style: Custom subtitle style (uses default if None)
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if burn_subtitles and subtitle_path and subtitle_path.exists():
-        # Burn subtitles into video
+        # Get video resolution for ASS PlayRes
+        video_width, video_height = 1920, 1080  # Default
+        try:
+            probe_cmd = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0",
+                str(video_path),
+            ]
+            result = subprocess.run(probe_cmd, capture_output=True, text=True)
+            if result.returncode == 0 and result.stdout.strip():
+                w, h = result.stdout.strip().split(",")
+                video_width, video_height = int(w), int(h)
+        except Exception:
+            pass  # Use default resolution
+
+        # Convert SRT to ASS with styling
+        ass_path = convert_srt_to_ass(
+            subtitle_path,
+            output_path=subtitle_path.with_suffix(".ass"),
+            style=subtitle_style or get_default_subtitle_style(),
+            video_width=video_width,
+            video_height=video_height,
+            max_line_width=max_line_width,
+            max_lines=max_lines,
+            remove_speakers=True,
+        )
+
+        # Burn subtitles into video using ASS
         # Need to escape special characters in path for ffmpeg filter
-        sub_path_escaped = str(subtitle_path).replace("\\", "/").replace(":", "\\:")
+        sub_path_escaped = str(ass_path).replace("\\", "/").replace(":", "\\:")
+
+        # Get best available encoder (NVENC if available, otherwise libx264)
+        encoder, encoder_opts = get_video_encoder()
 
         cmd = [
             "ffmpeg",
@@ -493,7 +628,8 @@ def compose_video(
             "-map",
             "1:a",
             "-c:v",
-            "libx264",
+            encoder,
+            *encoder_opts,
             "-c:a",
             "aac",
             "-shortest",
@@ -562,6 +698,9 @@ def full_compose(
     separation_method: str = "demucs",
     overlap_strategy: str = "hybrid",
     max_speed: float = 1.5,
+    max_line_width: float = 22.0,
+    max_lines: int = 2,
+    subtitle_style: SubtitleStyle | None = None,
 ) -> Path:
     """
     Full composition pipeline.
@@ -580,6 +719,9 @@ def full_compose(
         separation_method: "demucs" or "spleeter"
         overlap_strategy: Strategy for TTS overlap ("truncate", "speed", "hybrid", "none")
         max_speed: Maximum speed multiplier for TTS speedup (default 1.5x)
+        max_line_width: Max subtitle line width for burn-in (CJK char units, default 22)
+        max_lines: Max lines per subtitle entry (default 2, 0=unlimited)
+        subtitle_style: Custom subtitle style for ASS (uses default from env if None)
     """
     if not check_ffmpeg():
         raise RuntimeError("FFmpeg not found. Please install FFmpeg.")
@@ -648,6 +790,9 @@ def full_compose(
         subtitle_path=srt_path if not burn_subtitles else srt_path,
         output_path=output_path,
         burn_subtitles=burn_subtitles,
+        max_line_width=max_line_width,
+        max_lines=max_lines,
+        subtitle_style=subtitle_style,
     )
 
     print(f"[Compose] Done! Output: {output_path}")

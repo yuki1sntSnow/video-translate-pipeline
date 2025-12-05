@@ -27,13 +27,8 @@ ENV/
 checkpoints/
 
 # Project - Working Directories
-input/
-output/
-temp/
-translate/
-final/
 logs/
-downloads/
+data/
 
 # Project - Sensitive Files
 .env

@@ -1,16 +1,17 @@
 # Video Translation Pipeline - Dependencies
+# whisperX: pip install whisperx
+# PyTorch-cuda: pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu129
 # Install: pip install -r requirements.txt
-# PyTorch: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 
+onnxruntime-gpu
 # === TTS (Fish Speech) ===
-torchaudio>=2.1.0
-soundfile>=0.12.0; sys_platform == "win32"  # Windows audio I/O
-einops>=0.7.0
-tiktoken>=0.5.0
-descript-audio-codec>=1.0.0
+soundfile; sys_platform == "win32"  # Windows audio I/O
+einops
+tiktoken
+descript-audio-codec
 
 # === LLM Translation ===
-openai>=2.8.1  # includes httpx for proxy support
+openai  # includes httpx for proxy support
 
 # === Video Download ===
 yt-dlp>=2025.1.0
